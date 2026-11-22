@@ -1,0 +1,17 @@
+*.json
+*.slnx
+*.vcxproj
+*.filters
+*.user
+*.sln
+.cache
+bin
+obj
+ipch
+.vs
+.vscode
+.DS_STORE
+compile_commands
+GraphicsLIB
+GraphicsTest
+premake-export-compile-commands

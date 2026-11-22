@@ -1,0 +1,29 @@
+{
+    "folders":
+    [
+        {
+            "path": ".",
+            "folder_exclude_patterns": ["bin", "bin-int", ".vs", "obj"],
+            "file_exclude_patterns": ["*.sln", "*.vcxproj", "*.vcxproj.filters", "*.vcxproj.user"]
+        }
+    ],
+    "build_systems":
+    [
+        {
+            "name": "GFX: Build Debug",
+            "shell_cmd": "\"${project_path}\\build.bat\" Debug"
+        },
+        {
+            "name": "GFX: Build Release",
+            "shell_cmd": "\"${project_path}\\build.bat\" Release"
+        },
+        {
+            "name": "GFX: Debug with Rad",
+            "shell_cmd": "start raddbg --target \"${project_path}\\bin\\Debug-windows-x86_64\\GraphicsTest\\GraphicsTest.exe\""
+        },
+        {
+            "name": "GFX: Generate Project Files",
+            "shell_cmd": "premake5 vs2026 && premake5 export-compile-commands && move /Y \"${project_path}\\compile_commands\\debug.json\" .\\"
+        }
+    ]
+}
