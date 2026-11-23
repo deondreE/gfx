@@ -1,6 +1,13 @@
+#include "font.hpp"
 #include "gfxpch.hpp"
 #include "renderer.hpp"
+#include "graphics_resources.hpp"
 #include "render_graph.hpp"
+#include <float.h>
+#include <fstream>
+#include <ratio>
+#include <sstream>
+#include <string>
 namespace gfx {
 
 #if defined(WIN32)
@@ -23,9 +30,17 @@ namespace gfx {
 		DescriptorHandle transform_cbv;
 	};
 
+	// Tracking transient allocation packets to clean up when the GPU finishes frame execution
+	struct TransientAllocation {
+		GpuMemoryArena arena;
+		GpuBuffer vertex_buffer;
+		GpuBuffer index_buffer;
+	};
+
 	struct Renderer::Impl {
 		RenderGraph render_graph;
 		std::vector<RenderCommand> draw_queue;
+		std::vector<TransientAllocation> transient_allocs;
 	};
 
 	// Expose underlying DX12Context structure safely without changing its header definition.
@@ -54,6 +69,90 @@ namespace gfx {
 		b.Transition.StateBefore = before;
 		b.Transition.StateAfter = after;
 		return b;
+	}
+
+	static std::string extract_value(std::string const& token, std::string const& key) {
+		size_t pos = token.find("\"" + key + "\"");
+		if (pos == std::string::npos) return "";
+		size_t colon = token.find(":", pos);
+		if (colon == std::string::npos) return "";
+		size_t start = colon + 1;
+		while (start < token.size() && (std::isspace(token[start]) || token[start] == '"')) {
+			start++;
+		}
+		size_t end = start;
+		while (end < token.size() && !std::isspace(token[end]) && token[end] != ',' && token[end] != '}' && token[end] != ']' && token[end] != '"') {
+			end++;
+		}
+		return token.substr(start, end - start);
+	}
+
+	Font Renderer::load_font(const std::wstring &json_path, const std::wstring &texture_path) {
+		std::ifstream file(json_path);
+		if (!file.is_open()) {
+			throw std::runtime_error("Failed to open MSDF Font json file.");
+		}
+
+		std::stringstream buffer;
+		buffer << file.rdbuf();
+		std::string content = buffer.str();
+
+		Font font;
+		font.texture = create_texture_from_file(texture_path);
+
+		std::string atlas_section = content.substr(0, content.find("\"glyphs\""));
+		font.geometry.em_size = std::stof(extract_value(atlas_section, "size"));
+
+		// Search and extract horizontal layout configuration rules
+		size_t metrics_pos = content.find("\"metrics\"");
+		if (metrics_pos != std::string::npos) {
+			std::string metrics_section = content.substr(metrics_pos, content.find("}", metrics_pos) - metrics_pos);
+			font.geometry.line_height = std::stof(extract_value(metrics_section, "lineHeight"));
+			font.geometry.ascender = std::stof(extract_value(metrics_section, "ascender"));
+			font.geometry.descender = std::stof(extract_value(metrics_section, "descender"));
+		}
+
+		size_t glyph_list_start = content.find("\"glyphs\": [");
+		if (glyph_list_start != std::string::npos) {
+			size_t cursor = glyph_list_start;
+			while (true) {
+				size_t start_glyph = content.find("{", cursor);
+				size_t end_glyph = content.find("}", start_glyph);
+				if (start_glyph == std::string::npos || end_glyph == std::string::npos || start_glyph > content.find("]", glyph_list_start)) {
+					break;
+				}
+
+				std::string glyph_data = content.substr(start_glyph, end_glyph - start_glyph);
+
+				MSDFGlyph glyph = {};
+				glyph.codepoint = std::stoul(extract_value(glyph_data, "unicode"));
+				glyph.advance = std::stof(extract_value(glyph_data, "advance"));
+
+				// Parse plane bounds configuration (normalized font metrics spacing bounds)
+				size_t plane_bounds = glyph_data.find("\"planeBounds\"");
+				if (plane_bounds != std::string::npos) {
+					std::string plane_data = glyph_data.substr(plane_bounds, glyph_data.find("}", plane_bounds) - plane_bounds);
+					glyph.plane_bounds_left = std::stof(extract_value(plane_data, "left"));
+					glyph.plane_bounds_bottom = std::stof(extract_value(plane_data, "bottom"));
+					glyph.plane_bounds_right = std::stof(extract_value(plane_data, "right"));
+					glyph.plane_bounds_top = std::stof(extract_value(plane_data, "top"));
+				}
+
+				// Parse atlas bounds configuration (Normalized UV positioning mapping bounds)
+				size_t atlas_bounds = glyph_data.find("\"atlasBounds\"");
+				if (atlas_bounds != std::string::npos) {
+					std::string atlas_data = glyph_data.substr(atlas_bounds, glyph_data.find("}", atlas_bounds) - atlas_bounds);
+					glyph.atlas_bounds_left = std::stof(extract_value(atlas_data, "left")) / font.texture.width;
+					glyph.atlas_bounds_bottom = 1.0f - (std::stof(extract_value(atlas_data, "bottom")) / font.texture.height);
+					glyph.atlas_bounds_right = std::stof(extract_value(atlas_data, "right")) / font.texture.width;
+					glyph.atlas_bounds_top = 1.0f - (std::stof(extract_value(atlas_data, "top")) / font.texture.height);
+				}
+
+				font.geometry.glyphs[glyph.codepoint] = glyph;
+				cursor = end_glyph + 1;
+			}
+		}
+		return font;
 	}
 
 	Renderer::Renderer(GraphicsContext& context)
@@ -209,6 +308,97 @@ namespace gfx {
 		});
 	}
 
+	void Renderer::draw_text(std::string const& text, Font const& font, Mat4 const& transform, float font_size) {
+		if (text.empty()) return;
+
+		std::vector<Vertex> vertices;
+		std::vector<u8> indices;
+
+		vertices.reserve(text.size() * 4);
+		indices.reserve(text.size() * 6);
+
+		float cursor_x = 0.0f;
+		float cursor_y = 0.0f;
+		const float scale = font_size / font.geometry.em_size;
+
+		u32 quad_index = 0;
+		for (char c : text) {
+			if (c == '\n') {
+				cursor_y -= font.geometry.line_height * scale;
+				cursor_x = 0.0f;
+				continue;
+			}
+
+			auto it = font.geometry.glyphs.find(static_cast<u32>(c));
+			if (it == font.geometry.glyphs.end()) continue;
+
+			const MSDFGlyph& glyph = it->second;
+
+			// Skip layout calculations for whitespace, but advance cursor.
+			if (c == ' ') {
+				cursor_x += glyph.advance * scale;
+				continue;
+			}
+
+			// Project plane;
+			float x0 = cursor_x + glyph.plane_bounds_left * scale;
+			float y0 = cursor_y + glyph.plane_bounds_bottom * scale;
+			float x1 = cursor_x + glyph.plane_bounds_left * scale;
+			float y1 = cursor_y + glyph.plane_bounds_top * scale;
+
+			// Tex Coord mapping;
+			float u0 = glyph.atlas_bounds_left;
+			float v0 = glyph.atlas_bounds_bottom;
+			float u1 = glyph.atlas_bounds_right;
+			float v1 = glyph.atlas_bounds_top;
+
+			// Vertices
+			vertices.push_back({ { x0, y0, 0.0f }, { u0, v0 } });
+			vertices.push_back({ { x1, y0, 0.0f }, { u1, v0 } });
+			vertices.push_back({ { x1, y1, 0.0f }, { u1, v1 } });
+			vertices.push_back({ { x0, y1, 0.0f }, { u0, v1 } });
+
+			// Triangulation
+			u32 base = quad_index * 4;
+			indices.push_back(base + 0);
+			indices.push_back(base + 1);
+			indices.push_back(base + 2);
+
+			indices.push_back(base + 0);
+			indices.push_back(base + 2);
+			indices.push_back(base + 3);
+			cursor_x += glyph.advance * scale;
+			quad_index++;
+		}
+
+		if (vertices.empty()) return;
+
+		const u32 vert_size = static_cast<u32>(vertices.size() * sizeof(Vertex));
+		const u32 index_size = static_cast<u32>(indices.size() * sizeof(u32));
+
+		GpuMemoryArena dynamic_arena = _context.create_arena(MemoryUsage::Upload, vert_size + index_size + 512);
+	    GpuBuffer vertex_buffer = _context.create_buffer(dynamic_arena, vert_size, sizeof(Vertex));
+	    GpuBuffer index_buffer = _context.create_buffer(dynamic_arena, index_size, sizeof(u32));
+
+	    std::memcpy(vertex_buffer.allocation.cpu_mapped_pointer, vertices.data(), vert_size);
+    	std::memcpy(index_buffer.allocation.cpu_mapped_pointer, indices.data(), index_size);
+
+  		Mesh dynamic_mesh = {
+	        .vertex_buffer = vertex_buffer,
+	        .index_buffer = index_buffer,
+	        .index_count = static_cast<u32>(indices.size())
+	    };
+
+	    _impl->transient_allocs.push_back({
+	    	.arena = dynamic_arena,
+	    	.vertex_buffer = vertex_buffer,
+	    	.index_buffer = index_buffer,
+	    });
+
+	    Material msdf_material = create_material(L"msdf_text.hlsl");
+	    draw_mesh(dynamic_mesh, msdf_material, transform, &font.texture);
+	}
+
 	void Renderer::end_frame() {
 		auto* raw_layout = reinterpret_cast<DX12ContextLayout*>(&_context);
 		auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(raw_layout->cmd_ctx.list.Get());
@@ -271,6 +461,14 @@ namespace gfx {
 
 		ID3D12CommandList* submission_list[] = { list };
 		raw_layout->device_ctx.command_queue->ExecuteCommandLists(1, submission_list);
+
+		for (auto& dynamic_alloc : _impl->transient_allocs) {
+			_context.destroy_buffer(dynamic_alloc.vertex_buffer);
+			_context.destroy_buffer(dynamic_alloc.index_buffer);
+			_context.destroy_arena(dynamic_alloc.arena);
+		}
+		_impl->transient_allocs.clear();
+
 		// present() is called once per frame by Application::run after on_render().
 	}
 

@@ -1,6 +1,8 @@
 #pragma once 
 #include "graphics_context.hpp"
+#include "font.hpp"
 #include "vendor/stb_image.h"
+#include <string>
 #include <vector>
 
 namespace gfx {
@@ -18,6 +20,9 @@ namespace gfx {
 
 		GpuTexture create_texture_from_file(std::wstring const& path);
 		void destroy_texture(GpuTexture& texture);
+
+		Font load_font(std::wstring const& json_path, std::wstring const& texture_path);
+		void draw_text(std::string const& text, Font const& font, Mat4 const& transform, float font_size);
 
 		// Simple Frame Rendering commands
 		void begin_frame();
