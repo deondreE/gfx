@@ -1,3 +1,8 @@
+#include "graphics_resources.hpp"
+#include <combaseapi.h>
+#include <cstring>
+#include <d3dcommon.h>
+#include <sys/types.h>
 #if defined(_WIN32)
 #include "graphics_context.hpp"
 
@@ -86,6 +91,16 @@ namespace gfx {
 		case MemoryUsage::Readback: return D3D12_HEAP_TYPE_READBACK;
 		}
 		return D3D12_HEAP_TYPE_DEFAULT;
+	}
+
+	static D3D12_RESOURCE_BARRIER make_transition(ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+		D3D12_RESOURCE_BARRIER b = {};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = res;
+		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = before;
+		b.Transition.StateAfter = after;
+		return b;
 	}
 
 	// static API to make things simpler to follow.
@@ -368,6 +383,40 @@ namespace gfx {
 		    };
 		}
 
+		virtual void  upload_buffer(GpuBuffer const& dst, const void* data, u32 size, BufferKind kind) override {
+			GpuMemoryArena staging_arena = create_arena(MemoryUsage::Upload, size);
+			GpuBuffer staging = create_buffer(staging_arena, size, 0);
+			std::memcpy(staging.allocation.cpu_mapped_pointer, data, size);
+
+			auto* dst_res = reinterpret_cast<ID3D12Resource*>(dst.native_resources);
+			auto* src_res = reinterpret_cast<ID3D12Resource*>(staging.native_resources);
+
+			ComPtr<ID3D12CommandAllocator> alloc;
+			ComPtr<ID3D12GraphicsCommandList> list;
+			if (FAILED(_device_ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
+				FAILED(_device_ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr , IID_PPV_ARGS(&list)))) {
+				throw std::runtime_error("Failed to create upload command list.");
+			}
+
+			const D3D12_RESOURCE_STATES final_state = (kind == BufferKind::Index)
+				? D3D12_RESOURCE_STATE_INDEX_BUFFER
+				: D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+
+			D3D12_RESOURCE_BARRIER pre = make_transition(dst_res, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+			list->ResourceBarrier(1, &pre);
+			list->CopyBufferRegion(dst_res, 0, src_res, 0, size);
+			D3D12_RESOURCE_BARRIER post = make_transition(dst_res, D3D12_RESOURCE_STATE_COPY_DEST, final_state);
+			list->ResourceBarrier(1, &post);
+			list->Close();
+
+			ID3D12CommandList* lists[] = { list.Get() };
+			_device_ctx.command_queue->ExecuteCommandLists(1, lists);
+			wait_for_gpu(_device_ctx, _swapchain, _sync);
+
+			destroy_buffer(staging);
+			destroy_arena(staging_arena);
+ 		}
+
 		void destroy_buffer(GpuBuffer& buffer) override {
 			if (buffer.native_resources) {
 				auto* resource = reinterpret_cast<ID3D12Resource*>(buffer.native_resources);
@@ -441,7 +490,7 @@ namespace gfx {
 					.Constants = {
 						.ShaderRegister = 0,
 						.RegisterSpace = 0,
-						.Num32BitValues = 17, // TODO: Ensure this is not a hardcoded number
+						.Num32BitValues = sizeof(DrawConstants) / 4,
 					},
 					.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL
 				};
@@ -675,7 +724,69 @@ namespace gfx {
 			list->SetDescriptorHeaps(1, heaps);
 		}
 
-		GpuTexture create_texture(TextureDescription const& desc, const void* initial_data) {
+		void submit_frame(const float clear_color[4], std::span<const DrawCommand> draws) override {
+			// present() waits for the GPU every frame, so resetting the allocator is safe.
+			_cmd_ctx.allocator->Reset();
+			_cmd_ctx.list->Reset(_cmd_ctx.allocator.Get(), nullptr);
+			auto* list = _cmd_ctx.list.Get();
+
+			ID3D12Resource* backbuffer = _swapchain.render_targets[_swapchain .frame_index].Get();
+			D3D12_RESOURCE_BARRIER to_rt = make_transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
+			list->ResourceBarrier(1, &to_rt);
+
+			D3D12_CPU_DESCRIPTOR_HANDLE rtv = _swapchain.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+			rtv.ptr += static_cast<SIZE_T>(_swapchain.frame_index) * _swapchain.rtvDescriptorSize;
+			list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+			list->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+
+			D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)_swapchain.width,(float)_swapchain.height, 0.0f, 1.0f };
+			D3D12_RECT scissor = { 0, 0, (LONG)_swapchain.width, (LONG)_swapchain.height };
+			list->RSSetViewports(1, &vp);
+			list->RSSetScissorRects(1, &scissor);
+
+			bind_descriptor_heaps(list);
+			const D3D12_GPU_DESCRIPTOR_HANDLE heap_start = _srv_cbv_uav_heap->GetGPUDescriptorHandleForHeapStart();
+
+			void* bound_root_sig = nullptr;
+			void* bound_pso = nullptr;
+			for (const DrawCommand& cmd : draws) {
+				// Only rebind whne the state actually changes.
+				if (cmd.material.root_signature.native_handle != bound_root_sig) {
+					bound_root_sig = cmd.material.root_signature.native_handle;
+					list->SetGraphicsRootSignature(reinterpret_cast<ID3D12RootSignature*>(bound_root_sig));
+					list->SetGraphicsRootDescriptorTable(1, heap_start); // root sig changes clears binding.
+				}
+				if (cmd.material.pipeline_state.native_handle != bound_pso) {
+					bound_pso = cmd.material.pipeline_state.native_handle;
+					list->SetPipelineState(reinterpret_cast<ID3D12PipelineState*>(bound_pso));
+				}
+				list->SetGraphicsRoot32BitConstants(0, sizeof(DrawConstants) / 4, &cmd.constants, 0);
+
+				D3D12_VERTEX_BUFFER_VIEW vbv = {
+					.BufferLocation = reinterpret_cast<ID3D12Resource*>(cmd.mesh.vertex_buffer.native_resources)->GetGPUVirtualAddress(),
+					.SizeInBytes = cmd.mesh.vertex_buffer.size_in_bytes,
+					.StrideInBytes = cmd.mesh.vertex_buffer.stride,
+				};
+				D3D12_INDEX_BUFFER_VIEW ibv = {
+					.BufferLocation = reinterpret_cast<ID3D12Resource*>(cmd.mesh.index_buffer.native_resources)->GetGPUVirtualAddress(),
+					.SizeInBytes = cmd.mesh.index_buffer.size_in_bytes,
+					.Format = DXGI_FORMAT_R32_UINT,
+				};
+				list->IASetVertexBuffers(0, 1, &vbv);
+				list->IASetIndexBuffer(&ibv);
+				list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+				list->DrawIndexedInstanced(cmd.mesh.index_count, 1, 0, 0, 0);
+			}
+
+			D3D12_RESOURCE_BARRIER to_present = make_transition(backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
+			list->ResourceBarrier(1, &to_present);
+			list->Close();
+
+			ID3D12CommandList* lists[] = { list };
+			_device_ctx.command_queue->ExecuteCommandLists(1, lists);
+		}
+
+		GpuTexture create_texture(TextureDescription const& desc, const void* initial_data) override {
 			GFX_ASSERT(_allocated_descriptors_count < MaxGlobalDescriptors, "Descriptor Heap Full!");
 
 			DXGI_FORMAT f;

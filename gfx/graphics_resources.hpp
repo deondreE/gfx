@@ -7,7 +7,6 @@ using u32 = uint32_t;
 using u8 = uint8_t;
 
 namespace gfx {
-
 	enum class MemoryUsage {
 		GpuOnly,  // Optimal GPU Read/Write (Textures, Static Vertex/Index Buffers)
 		Upload,   // Host-visible, CPU-writable (Constant Buffers, Dynamic Vertices)
@@ -120,4 +119,23 @@ namespace gfx {
 	struct Mat4 {
 		float m[4][4];
 	};
+
+
+	static constexpr u32 NO_TEXTURE = 0xFFFFFFFFu;
+	struct DrawConstants {
+		Mat4 transform;
+		u32 texture_index;
+	};
+	static_assert(sizeof(DrawConstants) == 17 * sizeof(u32), "DrawConstants must be 17 DWORDs");
+
+	struct DrawCommand {
+		Mesh mesh;
+		Material material;
+		DrawConstants constants;
+	};
+
+	enum class BufferKind {
+		Vertex, Index,
+	};
+
 }

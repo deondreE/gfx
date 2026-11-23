@@ -5,6 +5,8 @@
 #include "window.hpp"
 #include "graphics_resources.hpp"
 
+#include <span>
+
 namespace gfx {
 	struct DescriptorHandle {
 		u64 cpu_ptr = 0;
@@ -24,6 +26,7 @@ namespace gfx {
 		virtual void destroy_arena(GpuMemoryArena& arena) = 0;
 
 		virtual GpuBuffer      create_buffer(GpuMemoryArena& arena, u32 size, u32 stride) = 0;
+		virtual void           upload_buffer(GpuBuffer const& dst, const void* data, u32 size, BufferKind kind) = 0;
 		virtual void           destroy_buffer(GpuBuffer& buffer) = 0;
 
 		virtual GpuTexture create_texture(TextureDescription const& desc, const void* initial_data) = 0;
@@ -40,6 +43,8 @@ namespace gfx {
 		virtual DescriptorHandle allocate_descriptor(const GpuBuffer& buffer, DescriptorType type) = 0;
 		virtual void bind_descriptor_heaps(void* native_command_list) = 0;
 		virtual u64 get_descriptor_heap_gpu_start() = 0;
+
+		virtual void submit_frame(const float clear_color[4], std::span<const DrawCommand> draws) = 0;
 
 		static std::unique_ptr<GraphicsContext> create();
 	};

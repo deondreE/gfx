@@ -2,6 +2,7 @@
 
 // Standard Library
 #include <iostream>
+#include <span>
 #include <memory>
 #include <string>
 #include <cstring>
