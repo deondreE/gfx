@@ -50,15 +50,23 @@ public:
 
 ## Roadmap
 
-I want to have these features to tag actually usefull:
+Features I want in place before tagging a first useful release (v0.1).
 
-- [ ] Physics
-- [ ] Animation
-- [ ] Cinematic tools
-- [ ] Terrain tools
-- [ ] Audio - Native Audio Handles, Not FMOD
-- [x] Text Rendering through MSDF -- DONE
-- [ ] Manifest, some kind of packaging system.
+### Done
+- [x] MSDF text rendering
+
+### Now
+- [ ] Text Polish: layout, kerning, wrapping, rem-style sizing.
+- [ ] Asset Pipeline: packaging system for shaders, font, and textures.
+
+### Next
+- [ ] Audio: native platform backends: NO FMOD.
+- [ ] Animation: skeletal and property tweening.
+- [ ] Physics: broadphase, rigid bodies.
+
+### Later
+- [ ] Terrain: heightmap import, chunked mesh, LOD.
+- [ ] Cinematic Tools: camera paths, timeline sequencer.
 
 ## Contributing
 
