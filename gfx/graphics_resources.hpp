@@ -6,6 +6,8 @@ using u64 = uint64_t;
 using u32 = uint32_t;
 using u8 = uint8_t;
 
+#include "gfx_math.hpp"
+
 namespace gfx {
 	enum class MemoryUsage {
 		GpuOnly,  // Optimal GPU Read/Write (Textures, Static Vertex/Index Buffers)
@@ -114,10 +116,6 @@ namespace gfx {
 	struct Material {
 		PipelineState pipeline_state;
 		RootSignature root_signature;
-	};
-
-	struct Mat4 {
-		float m[4][4];
 	};
 
 

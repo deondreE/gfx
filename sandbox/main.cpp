@@ -70,6 +70,16 @@ protected:
             2, 3, 0,
         };
 
+        _viewport.x = 0.0f;
+        _viewport.y = 0.0f;
+        _viewport.width = 1280.0f;
+        _viewport.height = 720.0f;
+        _viewport.znear = 0.1f;
+        _viewport.zfar = 1000.0f;
+
+        _3d_camera.configure_isometric({0.0f, 0.0f, 0.0f}, 15.0f);
+        _ui_camera.configure_orthographic_ui(_viewport);
+
         _quad_mesh = _renderer->create_mesh(vertices, indices);
         _quad_material = _renderer->create_material(_shader_file_path);
 
@@ -79,29 +89,27 @@ protected:
     void on_update(float deltaTime) override {
         _running_time += deltaTime;
 
-        const float c = std::cos(_running_time);
-        const float s = std::sin(_running_time);
 
-        _transform = {};
-        _transform.m[0][0] = c;    _transform.m[0][1] = s;
-        _transform.m[1][0] = -s;   _transform.m[1][1] = c;
-        _transform.m[2][2] = 1.0f;
-        _transform.m[3][3] = 1.0f;
 
-        _text_transform = {};
-        _text_transform.m[0][0] = 0.05f; // Scale X
-        _text_transform.m[1][1] = 0.05f; // Scale Y
-        _text_transform.m[2][2] = 1.00f;
-        _text_transform.m[3][3] = 1.00f;
+        Mat4 model_rotate = Mat4::rotate_y(_running_time);
+        Mat4 view_proj_3d = _3d_camera.get_view_projection(_viewport);
 
-        _text_transform.m[3][0] = -0.9f; // Left side of screen
-        _text_transform.m[3][1] = -0.2f; // Vertical center-bottom
+        _transform = Mat4::mul(model_rotate, view_proj_3d);
+        // _transform = Mat4::scale({0.5f, 0.5f, 1.0f});
+
+        Mat4 text_model = Mat4::mul(
+            Mat4::scale({1.0f, 1.0f, 1.0f}),
+            Mat4::translate({ 50.0f, 100.0f, 0.0f})
+        );
+        Mat4 view_proj_ui = _ui_camera.get_view_projection(_viewport);
+        _text_transform = Mat4::mul(text_model, view_proj_ui);
+        // _text_transform.print(_text_transform);
     }
 
     void on_render() override {
         _renderer->begin_frame();
         _renderer->draw_mesh(_quad_mesh, _quad_material, _transform, _has_texture ? &_texture : nullptr);
-        _renderer->draw_text("Hello, Dx12 MSDF Text Renderer!", _font, _text_transform, 24.0f);
+        _renderer->draw_text_rem("Hello, Dx12 MSDF Text Renderer!", _font, _text_transform, 1.5f); // 24px
         _renderer->end_frame();
     }
 
@@ -128,6 +136,10 @@ private:
     bool _has_texture = false;
 
     Font _font;
+
+    Camera _3d_camera;
+    Camera _ui_camera;
+    Viewport _viewport;
 
     Mat4 _text_transform = {};
     Mat4 _transform = {};

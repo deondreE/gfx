@@ -40,7 +40,10 @@ To preserve the educational integrity of this engine, please refrain from using 
 I want to have these features to tag actually usefull:
 
 - [ ] Physics
+- [ ] Animation
+- [ ] Cinematic tools
+- [ ] Terrain tools
 - [ ] Audio - Native Audio Handles, Not FMOD
-- [ ] Text Rendering through MSDF
+- [x] Text Rendering through MSDF -- DONE
 - [ ] Manifest, some kind of packaging system.
 

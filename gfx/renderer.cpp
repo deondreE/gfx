@@ -45,25 +45,6 @@ namespace gfx {
 		DX12CommandContext cmd_ctx;
 	};
 
-	static void throw_if_failed(HRESULT hr, const char* what) {
-		if (FAILED(hr)) {
-			char buf[160];
-			std::snprintf(buf, sizeof(buf), "%s failed: 0x%08X", what, static_cast<unsigned>(hr));
-			throw std::runtime_error(buf);
-		}
-	}
-
-	static D3D12_RESOURCE_BARRIER make_transition_l(ID3D12Resource* res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
-		D3D12_RESOURCE_BARRIER b = {};
-		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		b.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-		b.Transition.pResource = res;
-		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		b.Transition.StateBefore = before;
-		b.Transition.StateAfter = after;
-		return b;
-	}
-
 	static std::string extract_value(std::string const& token, std::string const& key) {
 		size_t pos = token.find("\"" + key + "\"");
 		if (pos == std::string::npos) return "";
@@ -378,6 +359,7 @@ namespace gfx {
 	    Material msdf_material = create_material(L"assets/msdf_text.hlsl");
 	    draw_mesh(dynamic_mesh, msdf_material, transform, &font.texture);
 	}
+
 
 	void Renderer::end_frame() {
 		const float clear_color[4] = { 0.1f, 0.11f, 0.13f, 1.0f };
