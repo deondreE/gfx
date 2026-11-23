@@ -561,6 +561,31 @@ namespace gfx {
 				{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
 			};
 
+			D3D12_RENDER_TARGET_BLEND_DESC rt_blend = {};
+			if (!desc.depth_test_enabled) {
+				rt_blend.BlendEnable = TRUE;
+				rt_blend.LogicOpEnable = FALSE;
+				rt_blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+				rt_blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+				rt_blend.BlendOp = D3D12_BLEND_OP_ADD;
+				rt_blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+				rt_blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+				rt_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+				rt_blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+				rt_blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			} else {
+				rt_blend.BlendEnable = FALSE;
+				rt_blend.LogicOpEnable = FALSE;
+				rt_blend.SrcBlend = D3D12_BLEND_ONE;
+				rt_blend.DestBlend = D3D12_BLEND_ZERO;
+				rt_blend.BlendOp = D3D12_BLEND_OP_ADD;
+				rt_blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+				rt_blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+				rt_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+				rt_blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+				rt_blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+			}
+
 			D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {
 				.pRootSignature = reinterpret_cast<ID3D12RootSignature*>(desc.root_signature.native_handle),
 				.VS = { desc.vertex_shader.bytecode.data(), desc.vertex_shader.bytecode.size() },
@@ -568,25 +593,12 @@ namespace gfx {
 				.BlendState = {
 					.AlphaToCoverageEnable = FALSE,
 					.IndependentBlendEnable = FALSE,
-					.RenderTarget = {
-						{
-							.BlendEnable = FALSE,
-							.LogicOpEnable = FALSE,
-							.SrcBlend = D3D12_BLEND_ONE,
-							.DestBlend = D3D12_BLEND_ZERO,
-							.BlendOp = D3D12_BLEND_OP_ADD,
-							.SrcBlendAlpha = D3D12_BLEND_ONE,
-							.DestBlendAlpha = D3D12_BLEND_ZERO,
-							.BlendOpAlpha = D3D12_BLEND_OP_ADD,
-							.LogicOp = D3D12_LOGIC_OP_NOOP,
-							.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL
-						}
-					}
+					.RenderTarget = { rt_blend },
 				},
 				.SampleMask = UINT_MAX,
 				.RasterizerState = {
 					.FillMode = desc.wireframe_mode ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID,
-					.CullMode = D3D12_CULL_MODE_BACK,
+					.CullMode = D3D12_CULL_MODE_NONE,
 					.FrontCounterClockwise = FALSE,
 					.DepthBias = D3D12_DEFAULT_DEPTH_BIAS,
 					.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP,

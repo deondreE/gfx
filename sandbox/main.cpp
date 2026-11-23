@@ -73,15 +73,7 @@ protected:
         _quad_mesh = _renderer->create_mesh(vertices, indices);
         _quad_material = _renderer->create_material(_shader_file_path);
 
-        // Textures are optional: if the file is missing the quad is simply drawn untextured.
-        //try {
-        //    _texture = _renderer->create_texture_from_file(L"assets/texture.png");
-        //    _has_texture = true;
-        //    std::cout << "Texture loaded." << std::endl;
-        //}
-        //catch (const std::exception& e) {
-        //    std::cout << "No texture (" << e.what() << "), drawing untextured." << std::endl;
-        //}
+        _font = _renderer->load_font(L"../gfx/assets/roboto_metrics.json", L"../gfx/assets/roboto_atlas.png");
     }
 
     void on_update(float deltaTime) override {
@@ -95,11 +87,21 @@ protected:
         _transform.m[1][0] = -s;   _transform.m[1][1] = c;
         _transform.m[2][2] = 1.0f;
         _transform.m[3][3] = 1.0f;
+
+        _text_transform = {};
+        _text_transform.m[0][0] = 0.05f; // Scale X
+        _text_transform.m[1][1] = 0.05f; // Scale Y
+        _text_transform.m[2][2] = 1.00f;
+        _text_transform.m[3][3] = 1.00f;
+
+        _text_transform.m[3][0] = -0.9f; // Left side of screen
+        _text_transform.m[3][1] = -0.2f; // Vertical center-bottom
     }
 
     void on_render() override {
         _renderer->begin_frame();
         _renderer->draw_mesh(_quad_mesh, _quad_material, _transform, _has_texture ? &_texture : nullptr);
+        _renderer->draw_text("Hello, Dx12 MSDF Text Renderer!", _font, _text_transform, 24.0f);
         _renderer->end_frame();
     }
 
@@ -125,6 +127,9 @@ private:
     GpuTexture _texture;
     bool _has_texture = false;
 
+    Font _font;
+
+    Mat4 _text_transform = {};
     Mat4 _transform = {};
     float _running_time = 0.0f;
 };

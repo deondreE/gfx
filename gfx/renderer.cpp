@@ -87,6 +87,16 @@ namespace gfx {
 		return token.substr(start, end - start);
 	}
 
+	static size_t find_matching(std::string const& s, size_t open, char o, char c) {
+		int depth = 0;
+		for (size_t i = open; i < s.size(); ++i)
+		{
+			if (s[i] == o) ++depth;
+			else if (s[i] == c && --depth == 0) return i;
+		}
+		return std::string::npos;
+	}
+
 	Font Renderer::load_font(const std::wstring &json_path, const std::wstring &texture_path) {
 		std::ifstream file(json_path);
 		if (!file.is_open()) {
@@ -100,58 +110,93 @@ namespace gfx {
 		Font font;
 		font.texture = create_texture_from_file(texture_path);
 
-		std::string atlas_section = content.substr(0, content.find("\"glyphs\""));
+		size_t glyphs_key = content.find("\"glyphs\"");
+		if (glyphs_key == std::string::npos) {
+			throw std::runtime_error("Font json has no glyphs array.");
+		}
+
+		std::string atlas_section = content.substr(0, glyphs_key);
+		const bool y_origin_bottom = (extract_value(atlas_section, "yOrigin") != "top");
 		font.geometry.em_size = std::stof(extract_value(atlas_section, "size"));
 
-		// Search and extract horizontal layout configuration rules
 		size_t metrics_pos = content.find("\"metrics\"");
 		if (metrics_pos != std::string::npos) {
 			std::string metrics_section = content.substr(metrics_pos, content.find("}", metrics_pos) - metrics_pos);
 			font.geometry.line_height = std::stof(extract_value(metrics_section, "lineHeight"));
-			font.geometry.ascender = std::stof(extract_value(metrics_section, "ascender"));
-			font.geometry.descender = std::stof(extract_value(metrics_section, "descender"));
+			font.geometry.ascender    = std::stof(extract_value(metrics_section, "ascender"));
+			font.geometry.descender   = std::stof(extract_value(metrics_section, "descender"));
 		}
 
-		size_t glyph_list_start = content.find("\"glyphs\": [");
-		if (glyph_list_start != std::string::npos) {
-			size_t cursor = glyph_list_start;
-			while (true) {
-				size_t start_glyph = content.find("{", cursor);
-				size_t end_glyph = content.find("}", start_glyph);
-				if (start_glyph == std::string::npos || end_glyph == std::string::npos || start_glyph > content.find("]", glyph_list_start)) {
-					break;
+		size_t arr_open = content.find('[', glyphs_key);
+		if (arr_open == std::string::npos) {
+			throw std::runtime_error("Font json glyphs array is malformed.");
+		}
+		size_t arr_close = find_matching(content, arr_open, '[', ']');
+		if (arr_close == std::string::npos) {
+			throw std::runtime_error("Font json glyphs array is not terminated.");
+		}
+
+		size_t cursor = arr_open + 1;
+		while (true) {
+			size_t gs = content.find('{', cursor);
+			if (gs == std::string::npos || gs > arr_close) break;
+
+			size_t ge = find_matching(content, gs, '{', '}');
+			if (ge == std::string::npos) break;
+
+			std::string glyph_data = content.substr(gs, ge - gs + 1);
+			cursor = ge + 1;
+
+			std::string unicode_str = extract_value(glyph_data, "unicode");
+			if (unicode_str.empty()) continue;
+
+			MSDFGlyph glyph = {};
+			glyph.codepoint = std::stoul(unicode_str);
+			glyph.advance = std::stof(extract_value(glyph_data, "advance"));
+
+			// planeBounds / atlasBounds are flat objects, so the first '}' after the key is correct.
+			size_t plane_bounds = glyph_data.find("\"planeBounds\"");
+			if (plane_bounds != std::string::npos) {
+				std::string plane_data = glyph_data.substr(plane_bounds, glyph_data.find("}", plane_bounds) - plane_bounds);
+				glyph.plane_bounds_left  = std::stof(extract_value(plane_data, "left"));
+				glyph.plane_bounds_right = std::stof(extract_value(plane_data, "right"));
+
+				float pb = std::stof(extract_value(plane_data, "bottom"));
+				float pt = std::stof(extract_value(plane_data, "top"));
+				if (!y_origin_bottom) { // y-down in the JSON -> convert to y-up for our quads
+					pb = -pb;
+					pt = -pt;
 				}
-
-				std::string glyph_data = content.substr(start_glyph, end_glyph - start_glyph);
-
-				MSDFGlyph glyph = {};
-				glyph.codepoint = std::stoul(extract_value(glyph_data, "unicode"));
-				glyph.advance = std::stof(extract_value(glyph_data, "advance"));
-
-				// Parse plane bounds configuration (normalized font metrics spacing bounds)
-				size_t plane_bounds = glyph_data.find("\"planeBounds\"");
-				if (plane_bounds != std::string::npos) {
-					std::string plane_data = glyph_data.substr(plane_bounds, glyph_data.find("}", plane_bounds) - plane_bounds);
-					glyph.plane_bounds_left = std::stof(extract_value(plane_data, "left"));
-					glyph.plane_bounds_bottom = std::stof(extract_value(plane_data, "bottom"));
-					glyph.plane_bounds_right = std::stof(extract_value(plane_data, "right"));
-					glyph.plane_bounds_top = std::stof(extract_value(plane_data, "top"));
-				}
-
-				// Parse atlas bounds configuration (Normalized UV positioning mapping bounds)
-				size_t atlas_bounds = glyph_data.find("\"atlasBounds\"");
-				if (atlas_bounds != std::string::npos) {
-					std::string atlas_data = glyph_data.substr(atlas_bounds, glyph_data.find("}", atlas_bounds) - atlas_bounds);
-					glyph.atlas_bounds_left = std::stof(extract_value(atlas_data, "left")) / font.texture.width;
-					glyph.atlas_bounds_bottom = 1.0f - (std::stof(extract_value(atlas_data, "bottom")) / font.texture.height);
-					glyph.atlas_bounds_right = std::stof(extract_value(atlas_data, "right")) / font.texture.width;
-					glyph.atlas_bounds_top = 1.0f - (std::stof(extract_value(atlas_data, "top")) / font.texture.height);
-				}
-
-				font.geometry.glyphs[glyph.codepoint] = glyph;
-				cursor = end_glyph + 1;
+				glyph.plane_bounds_bottom = pb;
+				glyph.plane_bounds_top    = pt;
 			}
+
+			size_t atlas_bounds = glyph_data.find("\"atlasBounds\"");
+			if (atlas_bounds != std::string::npos) {
+				std::string atlas_data = glyph_data.substr(atlas_bounds, glyph_data.find("}", atlas_bounds) - atlas_bounds);
+
+				const float W = static_cast<float>(font.texture.width);
+				const float H = static_cast<float>(font.texture.height);
+
+				float l = std::stof(extract_value(atlas_data, "left"))   / W;
+				float r = std::stof(extract_value(atlas_data, "right"))  / W;
+				float b = std::stof(extract_value(atlas_data, "bottom")) / H;
+				float t = std::stof(extract_value(atlas_data, "top"))    / H;
+
+				if (y_origin_bottom) { // image rows run top-down, JSON measured from the bottom
+					b = 1.0f - b;
+					t = 1.0f - t;
+				}
+				glyph.atlas_bounds_left   = l;
+				glyph.atlas_bounds_right  = r;
+				glyph.atlas_bounds_bottom = b;
+				glyph.atlas_bounds_top    = t;
+			}
+
+			font.geometry.glyphs[glyph.codepoint] = glyph;
 		}
+
+		std::cout << "Loaded " << font.geometry.glyphs.size() << " glyphs, em_size=" << font.geometry.em_size << std::endl;
 		return font;
 	}
 
@@ -292,6 +337,12 @@ namespace gfx {
 	}
 
 	void Renderer::begin_frame() {
+		for (auto& dynamic_alloc : _impl->transient_allocs) {
+			_context.destroy_buffer(dynamic_alloc.vertex_buffer);
+			_context.destroy_buffer(dynamic_alloc.index_buffer);
+			_context.destroy_arena(dynamic_alloc.arena);
+		}
+		_impl->transient_allocs.clear();
 		_impl->draw_queue.clear();
 		_impl->render_graph.reset();
 	}
@@ -312,7 +363,7 @@ namespace gfx {
 		if (text.empty()) return;
 
 		std::vector<Vertex> vertices;
-		std::vector<u8> indices;
+		std::vector<u32> indices;
 
 		vertices.reserve(text.size() * 4);
 		indices.reserve(text.size() * 6);
@@ -343,21 +394,19 @@ namespace gfx {
 			// Project plane;
 			float x0 = cursor_x + glyph.plane_bounds_left * scale;
 			float y0 = cursor_y + glyph.plane_bounds_bottom * scale;
-			float x1 = cursor_x + glyph.plane_bounds_left * scale;
+			float x1 = cursor_x + glyph.plane_bounds_right * scale;
 			float y1 = cursor_y + glyph.plane_bounds_top * scale;
 
 			// Tex Coord mapping;
 			float u0 = glyph.atlas_bounds_left;
-			float v0 = glyph.atlas_bounds_bottom;
 			float u1 = glyph.atlas_bounds_right;
+			float v0 = glyph.atlas_bounds_bottom;      // bottom vertices (y0)
 			float v1 = glyph.atlas_bounds_top;
-
 			// Vertices
 			vertices.push_back({ { x0, y0, 0.0f }, { u0, v0 } });
 			vertices.push_back({ { x1, y0, 0.0f }, { u1, v0 } });
 			vertices.push_back({ { x1, y1, 0.0f }, { u1, v1 } });
 			vertices.push_back({ { x0, y1, 0.0f }, { u0, v1 } });
-
 			// Triangulation
 			u32 base = quad_index * 4;
 			indices.push_back(base + 0);
@@ -376,9 +425,13 @@ namespace gfx {
 		const u32 vert_size = static_cast<u32>(vertices.size() * sizeof(Vertex));
 		const u32 index_size = static_cast<u32>(indices.size() * sizeof(u32));
 
-		GpuMemoryArena dynamic_arena = _context.create_arena(MemoryUsage::Upload, vert_size + index_size + 512);
-	    GpuBuffer vertex_buffer = _context.create_buffer(dynamic_arena, vert_size, sizeof(Vertex));
-	    GpuBuffer index_buffer = _context.create_buffer(dynamic_arena, index_size, sizeof(u32));
+		constexpr u64 HEAP_ALIGN = 65536;
+		auto align_up_64k = [](u64 v) { return (v + HEAP_ALIGN - 1) & ~(HEAP_ALIGN - 1); };
+		const u64 arena_size = align_up_64k(vert_size) + align_up_64k(index_size);
+
+		GpuMemoryArena dynamic_arena = _context.create_arena(MemoryUsage::Upload, arena_size);
+		GpuBuffer vertex_buffer = _context.create_buffer(dynamic_arena, vert_size, sizeof(Vertex));
+		GpuBuffer index_buffer = _context.create_buffer(dynamic_arena, index_size, sizeof(u32));
 
 	    std::memcpy(vertex_buffer.allocation.cpu_mapped_pointer, vertices.data(), vert_size);
     	std::memcpy(index_buffer.allocation.cpu_mapped_pointer, indices.data(), index_size);
@@ -395,7 +448,7 @@ namespace gfx {
 	    	.index_buffer = index_buffer,
 	    });
 
-	    Material msdf_material = create_material(L"msdf_text.hlsl");
+	    Material msdf_material = create_material(L"assets/msdf_text.hlsl");
 	    draw_mesh(dynamic_mesh, msdf_material, transform, &font.texture);
 	}
 
@@ -461,14 +514,6 @@ namespace gfx {
 
 		ID3D12CommandList* submission_list[] = { list };
 		raw_layout->device_ctx.command_queue->ExecuteCommandLists(1, submission_list);
-
-		for (auto& dynamic_alloc : _impl->transient_allocs) {
-			_context.destroy_buffer(dynamic_alloc.vertex_buffer);
-			_context.destroy_buffer(dynamic_alloc.index_buffer);
-			_context.destroy_arena(dynamic_alloc.arena);
-		}
-		_impl->transient_allocs.clear();
-
 		// present() is called once per frame by Application::run after on_render().
 	}
 

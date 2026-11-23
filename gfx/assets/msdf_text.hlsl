@@ -9,16 +9,19 @@ struct VSOutput {
 };
 
 cbuffer DrawConstants : register(b0) {
-	float4x4 transform;
+	row_major float4x4 transform;
 	uint texture_index;
 };
 
 Texture2D<float4> bindlessTextures[1024] : register(t0);
 SamplerState LinearSampler : register(s0);
 
+// Must match "distanceRange" in your atlas JSON (the "atlas" section).
+static const float PX_RANGE = 4.0f;
+
 VSOutput VSMain(VSInput input) {
 	VSOutput output;
-	output.position = mul(transform, float4(input.position, 1.0f));
+	output.position = mul(float4(input.position, 1.0f), transform);
 	output.uv = input.uv;
 	return output;
 }
@@ -28,18 +31,24 @@ float median(float r, float g, float b) {
 }
 
 float4 PSMain(VSOutput input) : SV_Target {
-	float3 msd = bindlessTextures[texture_index].Sample(LinearSampler, input.uv).rgb;
+	if (texture_index == 0xFFFFFFFFu) {
+		return float4(1.0f, 0.0f, 1.0f, 1.0f); // debug: magenta = no texture bound
+	}
+
+	Texture2D<float4> atlas = bindlessTextures[NonUniformResourceIndex(texture_index)];
+
+	uint w, h;
+	atlas.GetDimensions(w, h);
+
+	float3 msd = atlas.Sample(LinearSampler, input.uv).rgb;
 	float sd = median(msd.r, msd.g, msd.b);
 
-	float screen_px_range = 2.0f;
-	float2 dxdy = fwidth(input.uv);
-	float pixel_dist = (sd - 0.5f) * screen_px_range / length(dxdy);
+	// Standard msdfgen screen-pixel-range computation
+	float2 unit_range = PX_RANGE / float2(w, h);
+	float2 screen_tex_size = 1.0f / fwidth(input.uv);
+	float screen_px_range = max(0.5f * dot(unit_range, screen_tex_size), 1.0f);
 
-	float opacity = clamp(pixel_dist + 0.5f, 0.0f, 1.0f);
-
-	if (opacity < 0.01f) {
-		discard;
-	}
+	float opacity = saturate(screen_px_range * (sd - 0.5f) + 0.5f);
 
 	return float4(1.0f, 1.0f, 1.0f, opacity);
 }
