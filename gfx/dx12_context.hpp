@@ -1,8 +1,12 @@
 #include "graphics_resources.hpp"
+#include <basetsd.h>
 #include <combaseapi.h>
 #include <cstring>
 #include <d3dcommon.h>
+#include <stdlib.h>
+#include <synchapi.h>
 #include <sys/types.h>
+#include <winbase.h>
 #if defined(_WIN32)
 #include "graphics_context.hpp"
 
@@ -10,11 +14,14 @@
 #include <dxgi1_6.h>
 #include <wrl.h>
 #include <d3dcompiler.h>
-
+#include "util/paths.hpp"
 #include "util/util.hpp"
 
 #include <stdexcept>
 #include <vector>
+#include <deque>
+#include <functional>
+#include <span>
 
 using Microsoft::WRL::ComPtr;
 
@@ -74,15 +81,23 @@ namespace gfx {
 	};
 
 	struct DX12CommandContext {
-		ComPtr<ID3D12CommandAllocator> allocator;
+		ComPtr<ID3D12CommandAllocator> allocators[DX12Swapchain::FrameCount];
 		ComPtr<ID3D12GraphicsCommandList> list;
 	};
 
 	struct DX12SyncContext {
 		ComPtr<ID3D12Fence> fence;
-		UINT64 fence_value = 1;
+		UINT64 last_signaled = 0;
 		HANDLE fence_event = nullptr;
 	};
+
+	static void throw_if_failed(HRESULT hr, const char* what) {
+		if (FAILED(hr)) {
+			char buf[160];
+			std::snprintf(buf, sizeof(buf), "%s failed: 0x%08X", what, static_cast<unsigned>(hr));
+			throw std::runtime_error(buf);
+		}
+	}
 
 	static D3D12_HEAP_TYPE get_dx12_heap_type(MemoryUsage usage) {
 		switch (usage) {
@@ -171,17 +186,17 @@ namespace gfx {
 		create_rtvs(device_ctx, out_swapchain);
 	}
 
-	static void wait_for_gpu(DX12DeviceContext& device_ctx, DX12Swapchain& swapchain, DX12SyncContext& sync) {
-		const UINT64 fence_value_to_wait = sync.fence_value;
-		device_ctx.command_queue->Signal(sync.fence.Get(), fence_value_to_wait);
-		sync.fence_value++;
+	// static void wait_for_gpu(DX12DeviceContext& device_ctx, DX12Swapchain& swapchain, DX12SyncContext& sync) {
+	// 	const UINT64 fence_value_to_wait = sync.fence_value;
+	// 	device_ctx.command_queue->Signal(sync.fence.Get(), fence_value_to_wait);
+	// 	sync.fence_value++;
 
-		if (sync.fence->GetCompletedValue() < fence_value_to_wait) {
-			sync.fence->SetEventOnCompletion(fence_value_to_wait, sync.fence_event);
-			WaitForSingleObject(sync.fence_event, INFINITE);
-		}
-		swapchain.frame_index = swapchain.handle->GetCurrentBackBufferIndex();
-	}
+	// 	if (sync.fence->GetCompletedValue() < fence_value_to_wait) {
+	// 		sync.fence->SetEventOnCompletion(fence_value_to_wait, sync.fence_event);
+	// 		WaitForSingleObject(sync.fence_event, INFINITE);
+	// 	}
+	// 	swapchain.frame_index = swapchain.handle->GetCurrentBackBufferIndex();
+	// }
 
 	class DX12Context : public GraphicsContext {
 	public:
@@ -200,11 +215,17 @@ namespace gfx {
 
 			create_swapchain(_device_ctx, _hwnd, width, height, _swapchain);
 
-			_device_ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_cmd_ctx.allocator));
-			_device_ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _cmd_ctx.allocator.Get(), nullptr, IID_PPV_ARGS(&_cmd_ctx.list));
+			for (UINT i = 0; i < DX12Swapchain::FrameCount; i++) {
+				throw_if_failed(_device_ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&_cmd_ctx.allocators[i])), "CreateCommandAllocator");
+			}
+			throw_if_failed(_device_ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, _cmd_ctx.allocators[0].Get(), nullptr, IID_PPV_ARGS(&_cmd_ctx.list)), "CreateCommandList");
 			_cmd_ctx.list->Close();
-			_device_ctx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_sync.fence));
+
+			throw_if_failed(_device_ctx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&_sync.fence)), "CreateFence");
 			_sync.fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+			if (!_sync.fence_event) {
+				throw std::runtime_error("CreateEvent failed.");
+			}
 
 			D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {
 				.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -212,61 +233,38 @@ namespace gfx {
 				.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
 				.NodeMask = 0,
 			};
-			_device_ctx.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&_srv_cbv_uav_heap));
+			throw_if_failed(_device_ctx.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&_srv_cbv_uav_heap)), "CreateDescriptorHeap(SRV)");
 			_descriptor_size = _device_ctx.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 		}
 
+		void begin_frame() override {
+			if (_frame_begun) return;
+		}
+
 		void clear(float r, float g, float b, float a) override {
-			_cmd_ctx.allocator->Reset();
-			_cmd_ctx.list->Reset(_cmd_ctx.allocator.Get(), nullptr);
-
-			D3D12_RESOURCE_BARRIER barrier = {
-				.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-				.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE,
-			};
-			barrier.Transition = {
-				.pResource = _swapchain.render_targets[_swapchain.frame_index].Get(),
-				.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-				.StateBefore = D3D12_RESOURCE_STATE_PRESENT,
-				.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET,
-			};
-			_cmd_ctx.list->ResourceBarrier(1, &barrier);
-
-			D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle(_swapchain.rtv_heap->GetCPUDescriptorHandleForHeapStart());
-			rtvHandle.ptr += _swapchain.frame_index * _swapchain.rtvDescriptorSize;
-
 			const float clearColor[] = { r, g, b, a };
-			_cmd_ctx.list->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-
-			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-			_cmd_ctx.list->ResourceBarrier(1, &barrier);
-
-			_cmd_ctx.list->Close();
-
-			ID3D12CommandList* ppCommandLists[] = { _cmd_ctx.list.Get() };
-			_device_ctx.command_queue->ExecuteCommandLists(1, ppCommandLists);
+			submit_frame(clearColor, {});
 		}
 
 		void present() override {
 			_swapchain.handle->Present(1, 0);
-			wait_for_gpu(_device_ctx, _swapchain, _sync);
+			_frame_fence[_swapchain.frame_index] = signal();
+			_swapchain.frame_index = _swapchain.handle->GetCurrentBackBufferIndex();
+			_frame_begun = false;
 		}
 
 		void resize(int width, int height) override {
 			if (!_swapchain.handle || (width == _swapchain.width && height == _swapchain.height)) return;
 
-			wait_for_gpu(_device_ctx, _swapchain, _sync);
+			flush();
 
 			for (UINT i = 0; i < DX12Swapchain::FrameCount; i++) {
 				_swapchain.render_targets[i].Reset();
 			}
-
 			_swapchain.handle->ResizeBuffers(DX12Swapchain::FrameCount, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
 			_swapchain.width = width;
 			_swapchain.height = height;
 			_swapchain.frame_index = _swapchain.handle->GetCurrentBackBufferIndex();
-
 			create_rtvs(_device_ctx, _swapchain);
 		}
 
@@ -302,11 +300,10 @@ namespace gfx {
 		}
 
 		void destroy_arena(GpuMemoryArena& arena) override {
-			if (arena.native_heap) {
-				auto* native = reinterpret_cast<ID3D12Heap*>(arena.native_heap);
-				native->Release();
-				arena.native_heap = nullptr;
-			}
+			if (!arena.native_heap) return;
+			auto* heap = reinterpret_cast<ID3D12Heap*>(arena.native_heap);
+			arena.native_heap = nullptr;
+			defer([heap] { heap->Release(); });
 		}
 
 		GpuBuffer create_buffer(
@@ -384,6 +381,8 @@ namespace gfx {
 		}
 
 		virtual void  upload_buffer(GpuBuffer const& dst, const void* data, u32 size, BufferKind kind) override {
+			if (size == 0) return;
+
 			GpuMemoryArena staging_arena = create_arena(MemoryUsage::Upload, size);
 			GpuBuffer staging = create_buffer(staging_arena, size, 0);
 			std::memcpy(staging.allocation.cpu_mapped_pointer, data, size);
@@ -393,10 +392,8 @@ namespace gfx {
 
 			ComPtr<ID3D12CommandAllocator> alloc;
 			ComPtr<ID3D12GraphicsCommandList> list;
-			if (FAILED(_device_ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc))) ||
-				FAILED(_device_ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr , IID_PPV_ARGS(&list)))) {
-				throw std::runtime_error("Failed to create upload command list.");
-			}
+			throw_if_failed(_device_ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc)), "CreateCommandAllocator(upload)");
+			throw_if_failed(_device_ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), nullptr , IID_PPV_ARGS(&list)), "CreateCommandList(upload)");
 
 			const D3D12_RESOURCE_STATES final_state = (kind == BufferKind::Index)
 				? D3D12_RESOURCE_STATE_INDEX_BUFFER
@@ -407,25 +404,23 @@ namespace gfx {
 			list->CopyBufferRegion(dst_res, 0, src_res, 0, size);
 			D3D12_RESOURCE_BARRIER post = make_transition(dst_res, D3D12_RESOURCE_STATE_COPY_DEST, final_state);
 			list->ResourceBarrier(1, &post);
-			list->Close();
+			throw_if_failed(list->Close(), "Close upload list");
 
 			ID3D12CommandList* lists[] = { list.Get() };
 			_device_ctx.command_queue->ExecuteCommandLists(1, lists);
-			wait_for_gpu(_device_ctx, _swapchain, _sync);
+			flush();
 
 			destroy_buffer(staging);
 			destroy_arena(staging_arena);
  		}
 
 		void destroy_buffer(GpuBuffer& buffer) override {
-			if (buffer.native_resources) {
-				auto* resource = reinterpret_cast<ID3D12Resource*>(buffer.native_resources);
-				if (buffer.allocation.cpu_mapped_pointer) {
-					resource->Unmap(0, nullptr);
-				}
+			if (!buffer.native_resources) return;
+			auto* resource = reinterpret_cast<ID3D12Resource*>(buffer.native_resources);
+			defer([resource, mapped = buffer.allocation.cpu_mapped_pointer] {
+				if (mapped) resource->Unmap(0, nullptr);
 				resource->Release();
-				buffer.native_resources = nullptr;
-			}
+			});
 		}
 
 		ShaderBlob compile_shader(std::wstring const& filepath, std::string const& entry, ShaderStage stage) override {
@@ -447,7 +442,7 @@ namespace gfx {
 			DX12IncludeHandler include_handler;
 
 			HRESULT hr = D3DCompileFromFile(
-				filepath.c_str(),
+				util::paths::resolve_w(filepath).c_str(),
 				nullptr,
 				&include_handler,
 				entry.c_str(),
@@ -593,11 +588,11 @@ namespace gfx {
 		}
 
 		void destroy_root_signature(RootSignature& sig) override {
-			if (sig.native_handle) {
-				auto* native = reinterpret_cast<ID3D12RootSignature*>(sig.native_handle);
-				native->Release();
-				sig.native_handle = nullptr;
-			}
+			if (!sig.native_handle) return;
+			auto* native = reinterpret_cast<ID3D12RootSignature*>(sig.native_handle);
+			native->Release();
+			sig.native_handle = nullptr;
+			defer([native] { native->Release(); });
 		}
 
 		u64 get_descriptor_heap_gpu_start() override {
@@ -682,11 +677,10 @@ namespace gfx {
 		}
 
 		void destroy_pipeline_state(PipelineState& pipeline) override {
-			if (pipeline.native_handle) {
-				auto* native = reinterpret_cast<ID3D12PipelineState*>(pipeline.native_handle);
-				native->Release();
-				pipeline.native_handle = nullptr;
-			}
+			if (!pipeline.native_handle) return;
+			auto* native = reinterpret_cast<ID3D12PipelineState*>(pipeline.native_handle);
+			pipeline.native_handle = nullptr;
+			defer([native] {native->Release(); });
 		}
 
 		DescriptorHandle allocate_descriptor(const GpuBuffer& buffer, DescriptorType type) override {
@@ -725,10 +719,10 @@ namespace gfx {
 		}
 
 		void submit_frame(const float clear_color[4], std::span<const DrawCommand> draws) override {
-			// present() waits for the GPU every frame, so resetting the allocator is safe.
-			_cmd_ctx.allocator->Reset();
-			_cmd_ctx.list->Reset(_cmd_ctx.allocator.Get(), nullptr);
+			begin_frame();
+
 			auto* list = _cmd_ctx.list.Get();
+			throw_if_failed(_cmd_ctx.list->Reset(_cmd_ctx.allocators[_swapchain.frame_index].Get(), nullptr), "CommandList Reset");
 
 			ID3D12Resource* backbuffer = _swapchain.render_targets[_swapchain .frame_index].Get();
 			D3D12_RESOURCE_BARRIER to_rt = make_transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -780,178 +774,198 @@ namespace gfx {
 
 			D3D12_RESOURCE_BARRIER to_present = make_transition(backbuffer, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
 			list->ResourceBarrier(1, &to_present);
-			list->Close();
+			throw_if_failed(list->Close(), "CommandList Close");
 
 			ID3D12CommandList* lists[] = { list };
 			_device_ctx.command_queue->ExecuteCommandLists(1, lists);
 		}
 
 		GpuTexture create_texture(TextureDescription const& desc, const void* initial_data) override {
-			GFX_ASSERT(_allocated_descriptors_count < MaxGlobalDescriptors, "Descriptor Heap Full!");
+		    GFX_ASSERT(_allocated_descriptors_count < MaxGlobalDescriptors,
+		               "Descriptor Heap Full!");
 
-			DXGI_FORMAT f;
-			switch (desc.format) {
-			case TextureFormat::RGBA8_UNorm:
-				f = DXGI_FORMAT_R8G8B8A8_UNORM;
-			}
+		    DXGI_FORMAT f = DXGI_FORMAT_UNKNOWN;
+		    switch (desc.format) {
+		    case TextureFormat::RGBA8_UNorm: f = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+		    }
+		    GFX_ASSERT(f != DXGI_FORMAT_UNKNOWN, "Unsupported texture format!");
 
-			D3D12_RESOURCE_DESC tex_desc = {
-				.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-				.Alignment = 0,
-				.Width = desc.width,
-				.Height = desc.height,
-				.DepthOrArraySize = 1,
-				.MipLevels = 1,
-				.Format = f,
-				.SampleDesc = { .Count = 1 },
-				.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
-				.Flags = D3D12_RESOURCE_FLAG_NONE,
-			};
+		    D3D12_RESOURCE_DESC tex_desc = {
+		        .Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+		        .Alignment = 0,
+		        .Width = desc.width,
+		        .Height = desc.height,
+		        .DepthOrArraySize = 1,
+		        .MipLevels = 1,
+		        .Format = f,
+		        .SampleDesc = {.Count = 1},
+		        .Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+		        .Flags = D3D12_RESOURCE_FLAG_NONE,
+		    };
 
-			D3D12_HEAP_PROPERTIES gpu_heap_props = { .Type = D3D12_HEAP_TYPE_DEFAULT };
-			ID3D12Resource* native_texture = nullptr;
+		    D3D12_HEAP_PROPERTIES gpu_heap_props = {.Type = D3D12_HEAP_TYPE_DEFAULT};
+		    ComPtr<ID3D12Resource> native_texture;
+		    throw_if_failed(
+		        _device_ctx.device->CreateCommittedResource(
+		            &gpu_heap_props, D3D12_HEAP_FLAG_NONE, &tex_desc,
+		            D3D12_RESOURCE_STATE_COMMON, nullptr,
+		            IID_PPV_ARGS(&native_texture)),
+		        "CreateCommittedResource(texture)");
 
-			_device_ctx.device->CreateCommittedResource(
-				&gpu_heap_props,
-				D3D12_HEAP_FLAG_NONE,
-				&tex_desc,
-				D3D12_RESOURCE_STATE_COMMON,
-				nullptr,
-				IID_PPV_ARGS(&native_texture)
-			);
+		    u64 required_size = 0;
+		    D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
+		    _device_ctx.device->GetCopyableFootprints(
+		        &tex_desc, 0, 1, 0, &layout, nullptr, nullptr, &required_size);
 
-			u64 required_size = 0;
-			D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
-			_device_ctx.device->GetCopyableFootprints(&tex_desc, 0, 1, 0, &layout, nullptr, nullptr, &required_size);
+		    D3D12_HEAP_PROPERTIES upload_heap_props = {.Type = D3D12_HEAP_TYPE_UPLOAD};
+		    D3D12_RESOURCE_DESC upload_desc = {
+		        .Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
+		        .Width = required_size,
+		        .Height = 1,
+		        .DepthOrArraySize = 1,
+		        .MipLevels = 1,
+		        .Format = DXGI_FORMAT_UNKNOWN,
+		        .SampleDesc = {.Count = 1},
+		        .Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+		    };
 
-			D3D12_HEAP_PROPERTIES upload_heap_props = { .Type = D3D12_HEAP_TYPE_UPLOAD };
-			D3D12_RESOURCE_DESC upload_desc = {
-				.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER,
-				.Width = required_size,
-				.Height = 1,
-				.DepthOrArraySize = 1,
-				.MipLevels = 1,
-				.Format =  DXGI_FORMAT_UNKNOWN,
-				.SampleDesc = { .Count = 1 },
-				.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-			};
+		    ComPtr<ID3D12Resource> upload_buffer;
+		    throw_if_failed(
+		        _device_ctx.device->CreateCommittedResource(
+		            &upload_heap_props, D3D12_HEAP_FLAG_NONE, &upload_desc,
+		            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+		            IID_PPV_ARGS(&upload_buffer)),
+		        "CreateCommittedResource(texture upload)");
 
-			ID3D12Resource* upload_buffer = nullptr;
-			_device_ctx.device->CreateCommittedResource(
-				&upload_heap_props,
-				D3D12_HEAP_FLAG_NONE,
-				&upload_desc,
-				D3D12_RESOURCE_STATE_GENERIC_READ,
-				nullptr,
-				IID_PPV_ARGS(&upload_buffer)
-			);
+		    void* mapped_ptr = nullptr;
+		    D3D12_RANGE read_range = {0, 0};
+		    throw_if_failed(upload_buffer->Map(0, &read_range, &mapped_ptr),
+		                    "Map(texture upload)");
 
-			// Copy cpu mapped memory to gpu
-			void* mapped_ptr = nullptr;
-			D3D12_RANGE read_range = {0, 0};
-			upload_buffer->Map(0, &read_range, &mapped_ptr);
+		    const u8* src_pixels = static_cast<const u8*>(initial_data);
+		    u8* dest_pixels = static_cast<u8*>(mapped_ptr);
+		    const u32 src_pitch = desc.width * 4;
+		    for (u32 y = 0; y < desc.height; ++y) {
+		        std::memcpy(dest_pixels + y * layout.Footprint.RowPitch,
+		                    src_pixels + y * src_pitch, src_pitch);
+		    }
+		    upload_buffer->Unmap(0, nullptr);
 
-			const uint8_t* src_pixels = reinterpret_cast<const uint8_t*>(initial_data);
-			u8* dest_pixels = reinterpret_cast<uint8_t*>(mapped_ptr);
-			const u32 src_pitch = desc.width * 4;
+		    ComPtr<ID3D12CommandAllocator> temp_alloc;
+		    ComPtr<ID3D12GraphicsCommandList> temp_list;
+		    throw_if_failed(_device_ctx.device->CreateCommandAllocator(
+		                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+		                        IID_PPV_ARGS(&temp_alloc)),
+		                    "CreateCommandAllocator(texture)");
+		    throw_if_failed(_device_ctx.device->CreateCommandList(
+		                        0, D3D12_COMMAND_LIST_TYPE_DIRECT, temp_alloc.Get(),
+		                        nullptr, IID_PPV_ARGS(&temp_list)),
+		                    "CreateCommandList(texture)");
 
-			for (u32 y = 0; y < desc.height; ++y)
-			{
-				std::memcpy(
-					dest_pixels + (y * layout.Footprint.RowPitch),
-					src_pixels + (y * src_pitch),
-					src_pitch
-				);
-			}
-			upload_buffer->Unmap(0, nullptr);
+		    // COMMON -> COPY_DEST is implicit-promotable, but the explicit barrier
+		    // is fine.
+		    D3D12_RESOURCE_BARRIER barrier = make_transition(
+		        native_texture.Get(), D3D12_RESOURCE_STATE_COMMON,
+		        D3D12_RESOURCE_STATE_COPY_DEST);
+		    temp_list->ResourceBarrier(1, &barrier);
 
-			// Record copy execution commands
-			ComPtr<ID3D12CommandAllocator> temp_alloc;
-			ComPtr<ID3D12GraphicsCommandList> temp_list;
-			_device_ctx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&temp_alloc));
-    		_device_ctx.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, temp_alloc.Get(), nullptr, IID_PPV_ARGS(&temp_list));
+		    D3D12_TEXTURE_COPY_LOCATION dst_loc = {
+		        .pResource = native_texture.Get(),
+		        .Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+		        .SubresourceIndex = 0,
+		    };
+		    D3D12_TEXTURE_COPY_LOCATION src_loc = {
+		        .pResource = upload_buffer.Get(),
+		        .Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+		        .PlacedFootprint = layout,
+		    };
+		    temp_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
 
-    		// Common -> CopyDest
-    		D3D12_RESOURCE_BARRIER copy_barrier = {
-    			.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-    			.Transition = {
-    				.pResource = native_texture,
-    				.StateBefore = D3D12_RESOURCE_STATE_COMMON,
-    				.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST,
-    			}
-    		};
-    		temp_list->ResourceBarrier(1, &copy_barrier);
+		    barrier = make_transition(
+		        native_texture.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+		        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+		    temp_list->ResourceBarrier(1, &barrier);
 
-    		D3D12_TEXTURE_COPY_LOCATION dst_loc = {
-    			.pResource = native_texture,
-    			.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-    			.SubresourceIndex = 0
-    		};
-    		D3D12_TEXTURE_COPY_LOCATION src_loc = {
-    			.pResource = upload_buffer,
-    			.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-    			.PlacedFootprint = layout
-    		};
-    		temp_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+		    throw_if_failed(temp_list->Close(), "Close texture upload list");
 
-    		copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    		copy_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    		temp_list->ResourceBarrier(1, &copy_barrier);
+		    ID3D12CommandList* submission_list[] = {temp_list.Get()};
+		    _device_ctx.command_queue->ExecuteCommandLists(1, submission_list);
 
-    		temp_list->Close();
+		    flush(); // upload_buffer, temp_list and temp_alloc are safe after this
 
-    		ID3D12CommandList* submission_list[] = { temp_list.Get() };
-    		_device_ctx.command_queue->ExecuteCommandLists(1, submission_list);
-
-    		// Sync
-    		ComPtr<ID3D12Fence> fence;
-    		_device_ctx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-    		HANDLE fence_event = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    		_device_ctx.command_queue->Signal(fence.Get(), 1);
-    		if (fence->GetCompletedValue() < 1) {
-    			fence->SetEventOnCompletion(1, fence_event);
-    			WaitForSingleObject(fence_event, INFINITE);
-    		}
-    		CloseHandle(fence_event);
-    		upload_buffer->Release();
-
-    		//  Allocate descriptor in the Bindless Global SRV/CBV heap
-    		u32 srv_index = _allocated_descriptors_count;
-    		D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = _srv_cbv_uav_heap->GetCPUDescriptorHandleForHeapStart();
-    		cpu_handle.ptr += srv_index * _descriptor_size;
+		    // Descriptor in the global heap
+		    const u32 srv_index = _allocated_descriptors_count;
+		    D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle =
+		        _srv_cbv_uav_heap->GetCPUDescriptorHandleForHeapStart();
+		    cpu_handle.ptr += static_cast<SIZE_T>(srv_index) * _descriptor_size;
 
 		    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {
 		        .Format = f,
 		        .ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
 		        .Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-		        .Texture2D = { .MipLevels = 1 }
+		        .Texture2D = {.MipLevels = 1},
 		    };
-		    _device_ctx.device->CreateShaderResourceView(native_texture, &srv_desc, cpu_handle);
-
+		    _device_ctx.device->CreateShaderResourceView(
+		        native_texture.Get(), &srv_desc, cpu_handle);
 		    _allocated_descriptors_count++;
 
-			return GpuTexture {
-				.native_resource = native_texture,
-				.width = desc.width,
-				.height = desc.height,
-				.srv_index = srv_index
-			};
+		    return GpuTexture{
+		        .native_resource = native_texture.Detach(),
+		        .width = desc.width,
+		        .height = desc.height,
+		        .srv_index = srv_index,
+		    };
 		}
 
-		void destroy_texture(GpuTexture& texture) {
-			if (texture.native_resource) {
-				auto* resource = reinterpret_cast<ID3D12Resource*>(texture.native_resource);
-				resource->Release();
-				texture.native_resource = nullptr;
-			}
+		void destroy_texture(GpuTexture& texture) override {
+			if (!texture.native_resource) return;
+			auto* resource = reinterpret_cast<ID3D12Resource*>(texture.native_resource);
+			texture.native_resource = nullptr;
+			defer([resource] { resource->Release(); });
 		}
 
 	private:
 		void shutdown() {
+			if (_device_ctx.command_queue && _sync.fence) {
+				flush();
+				collect_garbage(UINT64_MAX); // drain everything still queued.
+			}
+
 			if (_sync.fence_event) {
 				CloseHandle(_sync.fence_event);
+				_sync.fence_event = nullptr;
 			}
 		}
+
+		UINT64 signal() {
+			throw_if_failed(_device_ctx.command_queue->Signal(_sync.fence.Get(), ++_sync.last_signaled), "Signal");
+			return _sync.last_signaled;
+		}
+
+		void wait_for_value(UINT64 value) {
+			if (_sync.fence->GetCompletedValue() < value) {
+				throw_if_failed(_sync.fence->SetEventOnCompletion(value, _sync.fence_event), "SetOnEventCompletion");
+				WaitForSingleObject(_sync.fence_event, INFINITE);
+			}
+		}
+
+		void flush() { wait_for_value(signal()); }
+
+		void defer(std::function<void()> release) {
+			_pending_releases.push_back({ _sync.last_signaled + 1, std::move(release) });
+		}
+
+		void collect_garbage(UINT64 completed) {
+			while (!_pending_releases.empty() && _pending_releases.front().fence_value <= completed) {
+				_pending_releases.front().release();
+				_pending_releases.pop_front();
+			}
+		}
+
+		struct PendingRelease {
+			UINT64 fence_value;
+			std::function<void()> release;
+		};
 
 		HWND _hwnd = nullptr;
 		DX12DeviceContext _device_ctx;
@@ -959,8 +973,13 @@ namespace gfx {
 		DX12CommandContext _cmd_ctx;
 		DX12SyncContext _sync;
 		ComPtr<ID3D12DescriptorHeap> _srv_cbv_uav_heap;
-		UINT _descriptor_size;
+		UINT _descriptor_size = 0;
 		UINT _allocated_descriptors_count = 0;
+
+		std::deque<PendingRelease> _pending_releases;
+		UINT64 _frame_fence[DX12Swapchain::FrameCount] = {};
+		bool _frame_begun = false;
+
 		static constexpr UINT MaxGlobalDescriptors = 1024; // Big enough for simple rendering.
 	};
 

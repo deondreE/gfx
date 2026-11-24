@@ -20,6 +20,7 @@ namespace gfx {
 		virtual void init(Window& window) = 0;
 		virtual void clear(float r, float g, float b, float a) = 0;
 		virtual void present() = 0;
+		virtual void begin_frame() = 0;
 		virtual void resize(int width, int height) = 0;
 
 		virtual GpuMemoryArena create_arena(MemoryUsage usage, u64 capacity) = 0;
