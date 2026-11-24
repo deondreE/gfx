@@ -8,6 +8,7 @@
 #include "../graphics_resources.hpp"
 #include "../gfx_math.hpp"
 #include "../camera.hpp"
+#include "../util/paths.hpp"
 
 inline constexpr unsigned int megabytes(unsigned int value) {
 	return value * 1024 * 1024;
