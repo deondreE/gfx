@@ -8,7 +8,10 @@
 #include <ratio>
 #include <sstream>
 #include <stdexcept>
+#include <filesystem>
 #include <string>
+#include "util/paths.hpp"
+
 namespace gfx {
 
 #if defined(WIN32)
@@ -34,6 +37,9 @@ namespace gfx {
 		RenderGraph render_graph;
 		std::vector<DrawCommand> draw_queue;
 		std::vector<TransientAllocation> transient_allocs;
+
+		Material text_material;
+		bool has_text_material = false;
 	};
 
 	// Expose underlying DX12Context structure safely without changing its header definition.
@@ -180,11 +186,24 @@ namespace gfx {
 		_geometry_arena = _context.create_arena(MemoryUsage::GpuOnly, util::megabytes(128));
 	}
 
-	Renderer::~Renderer() 
+	Renderer::~Renderer()
 	{
+		for (auto& a : _impl->transient_allocs) {
+			_context.destroy_buffer(a.vertex_buffer);
+			_context.destroy_buffer(a.index_buffer);
+			_context.destroy_arena(a.arena);
+		}
+		_impl->transient_allocs.clear();
+
+		if (_impl->has_text_material) {
+			_context.destroy_pipeline_state(_impl->text_material.pipeline_state);
+			_context.destroy_root_signature(_impl->text_material.root_signature);
+			_impl->has_text_material = false;
+		}
+
 		_context.destroy_arena(_geometry_arena);
 	}
-	
+
 	Mesh Renderer::create_mesh(std::vector<Vertex> const& vertices, std::vector<u32> const& indices) {
 		const u32 vert_size = (u32)(vertices.size() * sizeof(Vertex));
 		const u32 index_size = (u32)(indices.size() * sizeof(u32));
@@ -245,6 +264,8 @@ namespace gfx {
 	}
 
 	void Renderer::begin_frame() {
+		_context.begin_frame();
+
 		for (auto& dynamic_alloc : _impl->transient_allocs) {
 			_context.destroy_buffer(dynamic_alloc.vertex_buffer);
 			_context.destroy_buffer(dynamic_alloc.index_buffer);
@@ -356,10 +377,14 @@ namespace gfx {
 	    	.index_buffer = index_buffer,
 	    });
 
-	    Material msdf_material = create_material(L"assets/msdf_text.hlsl");
-	    draw_mesh(dynamic_mesh, msdf_material, transform, &font.texture);
-	}
+	    if (!_impl->has_text_material) {
+	    	std::cout << std::filesystem::current_path() << std::endl;
+	    	_impl->text_material = create_material(L"assets/msdf_text.hlsl");
+			_impl->has_text_material = true;
+	    }
 
+	    draw_mesh(dynamic_mesh, _impl->text_material, transform, &font.texture);
+	}
 
 	void Renderer::end_frame() {
 		const float clear_color[4] = { 0.1f, 0.11f, 0.13f, 1.0f };

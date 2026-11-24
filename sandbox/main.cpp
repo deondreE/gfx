@@ -8,6 +8,7 @@ using namespace gfx;
 #include <memory>
 #include <string>
 #include <vector>
+#include <filesystem>
 
 class SandboxApp : public Application {
 public:
@@ -83,7 +84,8 @@ protected:
         _quad_mesh = _renderer->create_mesh(vertices, indices);
         _quad_material = _renderer->create_material(_shader_file_path);
 
-        _font = _renderer->load_font(L"../gfx/assets/roboto_metrics.json", L"../gfx/assets/roboto_atlas.png");
+        std::cout << std::filesystem::current_path() << std::endl;
+        _font = _renderer->load_font(util::paths::resolve_w("assets/roboto_metrics.json"), util::paths::resolve_w("assets/roboto_atlas.png"));
     }
 
     void on_update(float deltaTime) override {
